@@ -1,0 +1,6 @@
+RewriteEngine On
+RewriteBase /api/
+RewriteCond %{HTTP:Authorization} ^(.*)
+RewriteRule .* - [e=HTTP_AUTHORIZATION:%1]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [L]

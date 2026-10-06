@@ -1,0 +1,21 @@
+# secrets and local config
+backend/config/config.php
+.env
+*.env
+**/google-services.json
+**/firebase-service-account*.json
+**/key.properties
+*.jks
+*.keystore
+# runtime data
+backend/storage/public_media/*
+backend/storage/relay/*
+backend/storage/avatars/*
+backend/storage/logs/*
+backend/storage/fcm_token.json
+!backend/storage/**/.gitkeep
+# flutter
+app/.dart_tool/
+app/build/
+app/.flutter-plugins*
+app/android/local.properties
