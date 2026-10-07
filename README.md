@@ -19,9 +19,13 @@ CREATE USER 'hue'@'localhost' IDENTIFIED BY 'a-long-random-password';
 ```bash
 mysql -u root -p < database/schema.sql
 mysql -u root -p hue < database/migrations/002_phase2.sql
+mysql -u root -p hue < database/migrations/003_multi_personal_colors.sql
+mysql -u root -p hue < database/migrations/004_message_images.sql
+mysql -u root -p hue < database/migrations/005_message_edits_space_views.sql
+mysql -u root -p hue < database/migrations/006_chat_color_reveal.sql
 mysql -u root -p -e "GRANT ALL ON hue.* TO 'hue'@'localhost'; FLUSH PRIVILEGES;"
 ```
-Requires MySQL 8+ or MariaDB 10.5+. Run the migration exactly once.
+Requires MySQL 8+ or MariaDB 10.5+. Run each migration once, in order. On an existing server, run any migrations that have not yet been applied.
 
 ## 2. PHP backend
 Needs PHP 8.2+ with `pdo_mysql`, `mbstring`, `fileinfo`, `curl`, `openssl`, and Argon2 support.

@@ -13,7 +13,12 @@ header('Cache-Control: no-store');
 try {
   if (Config::get('force_https') && empty($_SERVER['HTTPS']) && ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') !== 'https')
     throw new ApiException('HTTPS required', 400);
-  $path = '/' . trim(preg_replace('#^/api#', '', parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH)), '/');
+  $requestPath = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
+  // Shared hosting may expose the repository root and execute this front
+  // controller through PATH_INFO, e.g. /backend/public/index.php/api/chats.
+  if (!empty($_SERVER['PATH_INFO'])) $requestPath = $_SERVER['PATH_INFO'];
+  elseif (preg_match('#/index\.php(/.*)$#', $requestPath, $match)) $requestPath = $match[1];
+  $path = '/' . trim(preg_replace('#^/api(?:/|$)#', '', $requestPath), '/');
   $req = new Request();
   RateLimiter::hit('ip:' . $req->ip(), 300, 60);
 
