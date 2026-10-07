@@ -1,5 +1,0 @@
-# Point the web root at backend/public. This file is a fallback for shared hosting.
-RewriteEngine On
-RewriteRule ^$ public/index.php [L]
-RewriteCond %{REQUEST_FILENAME} !-f
-RewriteRule ^(.*)$ public/index.php [L]
