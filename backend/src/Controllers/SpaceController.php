@@ -8,6 +8,7 @@ final class SpaceController {
     $u = Auth::user($r);
     $rows = Database::all("SELECT s.id, s.owner_id, s.title, s.description, s.created_at, o.display_name AS owner_name, o.code AS owner_code, o.personal_color AS owner_color,
         (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position LIMIT 1) AS cover_media_id,
+        (SELECT mime FROM space_media WHERE space_id = s.id ORDER BY position LIMIT 1) AS cover_mime,
         (SELECT COUNT(*) FROM space_media WHERE space_id = s.id) AS media_count,
         (SELECT COUNT(*) FROM space_impressions WHERE space_id = s.id) AS impressions,
         (SELECT COUNT(*) FROM space_views WHERE space_id = s.id) AS views
@@ -19,7 +20,7 @@ final class SpaceController {
       ORDER BY s.id DESC LIMIT 50", [$u['id'], $u['id'], $u['id'], $u['id'], $u['id']]);
     foreach ($rows as &$s) {
       $isOwner = (int)$s['owner_id'] === (int)$u['id'];
-      $s['media'] = array_column(Database::all('SELECT id FROM space_media WHERE space_id = ? ORDER BY position', [$s['id']]), 'id');
+      $s['media'] = Database::all('SELECT id, mime FROM space_media WHERE space_id = ? ORDER BY position', [$s['id']]);
       if ($isOwner) {
         $s['is_owner'] = true;
         $s['impression_summary'] = Database::all('SELECT kind, COUNT(*) AS total FROM space_impressions WHERE space_id = ? GROUP BY kind ORDER BY total DESC', [$s['id']]);
@@ -42,7 +43,7 @@ final class SpaceController {
     if (!$s || !$this->canView((int)$u['id'], $s)) throw new ApiException('Space not found', 404);
     $isOwner = (int)$s['owner_id'] === (int)$u['id'];
     if (!$isOwner) Database::run('INSERT IGNORE INTO space_views (space_id, user_id) VALUES (?,?)', [$s['id'], $u['id']]);
-    $s['media'] = array_map('intval', array_column(Database::all('SELECT id FROM space_media WHERE space_id = ? ORDER BY position', [$s['id']]), 'id'));
+    $s['media'] = Database::all('SELECT id, mime FROM space_media WHERE space_id = ? ORDER BY position', [$s['id']]);
     $mine = Database::one('SELECT kind FROM space_impressions WHERE space_id = ? AND user_id = ?', [$s['id'], $u['id']]);
     $s['my_impression'] = $mine['kind'] ?? null;
     if ($isOwner) {
@@ -73,21 +74,32 @@ final class SpaceController {
     RateLimiter::hit('upload:' . $u['id'], 10, 3600);
     $title = Validator::str($r->input('title'), 'Title', 1, 80);
     $files = $_FILES['images'] ?? null;
-    if (!$files || !is_array($files['name'])) throw new ApiException('Add at least one picture', 422);
-    if (count($files['name']) > 12) throw new ApiException('A Space holds up to 12 pictures', 422);
+    $isVideo = false;
+    if (!$files && isset($_FILES['video'])) {
+      $video = $_FILES['video']; $isVideo = true;
+      $files = ['name' => [$video['name']], 'type' => [$video['type']], 'tmp_name' => [$video['tmp_name']], 'error' => [$video['error']], 'size' => [$video['size']]];
+    }
+    if (!$files || !is_array($files['name'])) throw new ApiException('Add pictures or choose a video', 422);
+    if (count($files['name']) > 12) throw new ApiException('A Space holds up to 12 media items', 422);
 
     $sid = Database::insert("INSERT INTO spaces (owner_id, type, title, description) VALUES (?, 'public', ?, ?)",
       [$u['id'], $title, mb_substr((string)$r->input('description', ''), 0, 300)]);
     $dir = Config::get('storage') . '/public_media';
-    $allowed = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
+    $allowedImages = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
+    $allowedVideos = ['video/mp4' => 'mp4', 'video/webm' => 'webm', 'video/quicktime' => 'mov'];
     foreach ($files['tmp_name'] as $i => $tmp) {
       if ($files['error'][$i] !== UPLOAD_ERR_OK || !is_uploaded_file($tmp)) continue;
-      if ($files['size'][$i] > Config::get('max_upload_bytes')) continue;
+      $limit = $isVideo ? 100 * 1024 * 1024 : Config::get('max_upload_bytes');
+      if ($files['size'][$i] > $limit) continue;
       $mime = (new \finfo(FILEINFO_MIME_TYPE))->file($tmp);
-      if (!isset($allowed[$mime]) || !@getimagesize($tmp)) continue;          // verify it really is an image
-      $name = bin2hex(random_bytes(16)) . '.' . $allowed[$mime];               // never trust client file names
-      move_uploaded_file($tmp, "$dir/$name");
+      $extension = $isVideo ? ($allowedVideos[$mime] ?? null) : ($allowedImages[$mime] ?? null);
+      if (!$extension || (!$isVideo && !@getimagesize($tmp))) continue;       // verify media type from file contents
+      if (!move_uploaded_file($tmp, $dir . '/' . ($name = bin2hex(random_bytes(16)) . '.' . $extension))) continue;
       Database::insert('INSERT INTO space_media (space_id, path, mime, size, position) VALUES (?,?,?,?,?)', [$sid, $name, $mime, $files['size'][$i], $i]);
+    }
+    if ((int)(Database::one('SELECT COUNT(*) AS total FROM space_media WHERE space_id = ?', [$sid])['total'] ?? 0) === 0) {
+      Database::run('DELETE FROM spaces WHERE id = ?', [$sid]);
+      throw new ApiException($isVideo ? 'Choose a supported video up to 100 MB (MP4, WebM or MOV)' : 'Choose supported images up to the upload size limit', 422);
     }
     Response::ok(['space_id' => $sid]);
   }
@@ -112,8 +124,21 @@ final class SpaceController {
     $m = Database::one("SELECT m.path, m.mime, s.owner_id, o.space_visibility FROM space_media m JOIN spaces s ON s.id = m.space_id JOIN users o ON o.id = s.owner_id
         WHERE m.id = ? AND s.deleted_at IS NULL AND s.is_hidden = 0 AND s.type = 'public' AND o.is_banned = 0", [(int)$p['id']]);
     if (!$m || !$this->canView((int)$u['id'], $m)) throw new ApiException('Not found', 404);
-    header('Content-Type: ' . $m['mime']); header('Content-Disposition: inline'); header('Cache-Control: private, max-age=300');
-    readfile(Config::get('storage') . '/public_media/' . basename($m['path'])); exit;
+    $path = Config::get('storage') . '/public_media/' . basename($m['path']);
+    $size = filesize($path);
+    header('Content-Type: ' . $m['mime']); header('Content-Disposition: inline'); header('Accept-Ranges: bytes'); header('Cache-Control: private, max-age=300');
+    $start = 0; $end = $size - 1;
+    if (isset($_SERVER['HTTP_RANGE']) && preg_match('/bytes=(\d*)-(\d*)/', $_SERVER['HTTP_RANGE'], $range)) {
+      if ($range[1] === '' && $range[2] !== '') $start = max(0, $size - (int)$range[2]);
+      else { $start = (int)$range[1]; if ($range[2] !== '') $end = min($end, (int)$range[2]); }
+      if ($start > $end || $start >= $size) { http_response_code(416); header("Content-Range: bytes */$size"); exit; }
+      http_response_code(206); header("Content-Range: bytes $start-$end/$size");
+    }
+    header('Content-Length: ' . ($end - $start + 1));
+    $handle = fopen($path, 'rb'); fseek($handle, $start);
+    $remaining = $end - $start + 1;
+    while ($remaining > 0 && !feof($handle)) { $chunk = fread($handle, min(8192, $remaining)); echo $chunk; $remaining -= strlen($chunk); }
+    fclose($handle); exit;
   }
 
   public function impress(Request $r): void {

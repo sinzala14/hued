@@ -16,7 +16,7 @@ final class ChatController {
   public function list(Request $r): void {
     $u = Auth::user($r); $me = (int)$u['id'];
     $rows = Database::all("
-      SELECT c.id, o.id AS other_id, o.code, o.display_name, o.personal_color, o.color_visibility, o.profile_visibility, o.avatar_path, o.bio, cm.muted,
+      SELECT c.id, o.id AS other_id, o.code, o.display_name, o.personal_color, o.personal_colors, o.color_visibility, o.profile_visibility, o.avatar_path, o.bio, cm.muted,
              (SELECT CASE WHEN m.body <> '' THEN m.body WHEN EXISTS (SELECT 1 FROM message_media mm WHERE mm.message_id = m.id) THEN 'Photo' ELSE '' END
                 FROM messages m WHERE m.conversation_id = c.id AND m.deleted_at IS NULL AND m.id > cm.cleared_before_id ORDER BY m.id DESC LIMIT 1) AS last_body,
              (SELECT m.created_at FROM messages m WHERE m.conversation_id = c.id AND m.deleted_at IS NULL AND m.id > cm.cleared_before_id ORDER BY m.id DESC LIMIT 1) AS last_at,
