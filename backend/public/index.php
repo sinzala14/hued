@@ -59,8 +59,9 @@ try {
   $r->add('GET',  '/chats',            [C::class, 'list']);
   $r->add('POST', '/chats',            [C::class, 'open']);
   $r->add('GET',  '/chats/{id}/messages', [C::class, 'messages']);
-  $r->add('POST', '/messages/send',    [M::class, 'send']);
-  $r->add('POST', '/messages/image',   [M::class, 'sendImage']);
+  $r->add('POST', '/messages/send',       [M::class, 'send']);
+  $r->add('POST', '/messages/send-voice', [M::class, 'sendVoice']);
+  $r->add('POST', '/messages/image',      [M::class, 'sendImage']);
   $r->add('POST', '/messages/edit',    [M::class, 'edit']);
   $r->add('GET',  '/messages/media/{id}', [M::class, 'media']);
   $r->add('POST', '/messages/delete',  [M::class, 'delete']);
