@@ -95,22 +95,37 @@ final class MessageController {
     if (!$f || $f['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) throw new ApiException('Choose a voice note to send', 422);
     if ($f['size'] < 1 || $f['size'] > 10 * 1024 * 1024) throw new ApiException('Voice note must be between 1 byte and 10 MB', 422);
     $allowed = [
-      'audio/ogg'  => 'ogg',
-      'audio/mpeg' => 'mp3',
-      'audio/mp4'  => 'm4a',
-      'audio/webm' => 'webm',
-      'audio/aac'  => 'aac',
-      'audio/wav'  => 'wav',
+      'audio/ogg'   => 'ogg',
+      'audio/mpeg'  => 'mp3',
+      'audio/mp4'   => 'm4a',
+      'audio/x-m4a' => 'm4a',
+      'video/mp4'   => 'm4a',
+      'audio/webm'  => 'webm',
+      'audio/aac'   => 'aac',
+      'audio/x-aac' => 'aac',
+      'audio/wav'   => 'wav',
+      'audio/x-wav' => 'wav',
+      'audio/3gpp'  => '3gp',
+      'audio/amr'   => 'amr',
     ];
     $mime = (new \finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);
-    if (!isset($allowed[$mime])) throw new ApiException('Unsupported audio format', 422);
+    $ext = $allowed[$mime] ?? null;
+    if (!$ext) {
+      $clientExt = strtolower(pathinfo($f['name'] ?? '', PATHINFO_EXTENSION));
+      $extMap = ['m4a' => 'm4a', 'aac' => 'aac', 'mp3' => 'mp3', 'ogg' => 'ogg', 'wav' => 'wav', 'webm' => 'webm', '3gp' => '3gp'];
+      if (isset($extMap[$clientExt])) {
+        $ext = $extMap[$clientExt];
+        $mime = 'audio/' . ($ext === 'm4a' ? 'mp4' : $ext);
+      }
+    }
+    if (!$ext) throw new ApiException('Unsupported audio format', 422);
 
     $reply = $r->input('reply_to_id') ? Validator::int($r->input('reply_to_id'), 'reply_to_id') : null;
     if ($reply && !Database::one('SELECT 1 FROM messages WHERE id = ? AND conversation_id = ? AND deleted_at IS NULL', [$reply, $conv['id']])) $reply = null;
 
     $dir = Config::get('storage') . '/message_media';
     if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) throw new ApiException('Could not save voice note', 500);
-    $name = bin2hex(random_bytes(16)) . '.' . $allowed[$mime];
+    $name = bin2hex(random_bytes(16)) . '.' . $ext;
     if (!move_uploaded_file($f['tmp_name'], "$dir/$name")) throw new ApiException('Could not save voice note', 500);
     $pdo = Database::pdo();
     try {
@@ -130,7 +145,7 @@ final class MessageController {
     if (!$theirs || !$theirs['muted']) Notifier::send((int)$other['id'], 'message', $u['display_name'], 'Voice note',
       ['conversation_id' => (int)$conv['id'], 'message_id' => (int)$id, 'sender_id' => $me]);
     Response::ok(['message' => ['id' => $id, 'client_id' => $cid, 'sender_id' => $me, 'body' => '', 'reply_to_id' => $reply,
-      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id]]);
+      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id, 'is_voice' => true]]);
   }
 
   private function visible(int $mid, int $me): array {

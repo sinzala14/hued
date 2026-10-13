@@ -60,7 +60,9 @@ final class ChatController {
     $before = (int)$r->input('before', 0); $after = (int)$r->input('after', 0);
     $sql = 'SELECT m.id, m.client_id, m.sender_id, m.body, m.reply_to_id, m.status, DATE_FORMAT(m.created_at, "%Y-%m-%d %H:%i:%s.%f") AS created_at,
                    (m.edited_at IS NOT NULL) AS edited,
-                   (m.deleted_at IS NOT NULL) AS deleted, (SELECT mm.message_id FROM message_media mm WHERE mm.message_id = m.id) AS media_id
+                   (m.deleted_at IS NOT NULL) AS deleted,
+                   (SELECT mm.message_id FROM message_media mm WHERE mm.message_id = m.id) AS media_id,
+                   (SELECT mm.is_voice FROM message_media mm WHERE mm.message_id = m.id) AS is_voice
             FROM messages m WHERE m.conversation_id = ? AND m.id > ?'; $args = [$c['id'], $c['cleared_before_id']];
     if ($before) { $sql .= ' AND m.id < ?'; $args[] = $before; }
     if ($after)  { $sql .= ' AND m.id > ?'; $args[] = $after; }
@@ -72,6 +74,7 @@ final class ChatController {
       $m['id'] = (int)$m['id']; $m['sender_id'] = (int)$m['sender_id'];
       $m['deleted'] = (bool)$m['deleted']; $m['edited'] = (bool)$m['edited'];
       $m['media_id'] = $m['media_id'] === null ? null : (int)$m['media_id'];
+      $m['is_voice'] = (bool)($m['is_voice'] ?? 0);
     }
     // "delivered" is set only here: the server has handed the message to the recipient's device.
     Database::run("UPDATE messages SET status = 'delivered' WHERE conversation_id = ? AND sender_id <> ? AND status = 'sent' AND id > ?", [$c['id'], $me, $c['cleared_before_id']]);
@@ -84,9 +87,14 @@ final class ChatController {
     $q = Validator::str($r->input('q', ''), 'Search', 2, 60);
     $like = '%' . addcslashes($q, '%_\\') . '%';
     $rows = Database::all('SELECT m.id, m.client_id, m.sender_id, m.body, m.reply_to_id, m.status, DATE_FORMAT(m.created_at, "%Y-%m-%d %H:%i:%s.%f") AS created_at, 0 AS deleted, (m.edited_at IS NOT NULL) AS edited,
-        (SELECT mm.message_id FROM message_media mm WHERE mm.message_id = m.id) AS media_id
+        (SELECT mm.message_id FROM message_media mm WHERE mm.message_id = m.id) AS media_id,
+        (SELECT mm.is_voice FROM message_media mm WHERE mm.message_id = m.id) AS is_voice
         FROM messages m WHERE m.conversation_id = ? AND m.id > ? AND m.deleted_at IS NULL AND m.body LIKE ? ORDER BY m.id DESC LIMIT 50', [$c['id'], $c['cleared_before_id'], $like]);
-    foreach ($rows as &$m) { $m['id'] = (int)$m['id']; $m['sender_id'] = (int)$m['sender_id']; $m['deleted'] = false; $m['edited'] = (bool)$m['edited']; $m['media_id'] = $m['media_id'] === null ? null : (int)$m['media_id']; }
+    foreach ($rows as &$m) {
+      $m['id'] = (int)$m['id']; $m['sender_id'] = (int)$m['sender_id']; $m['deleted'] = false; $m['edited'] = (bool)$m['edited'];
+      $m['media_id'] = $m['media_id'] === null ? null : (int)$m['media_id'];
+      $m['is_voice'] = (bool)($m['is_voice'] ?? 0);
+    }
     Response::ok(['messages' => $rows]);
   }
 
