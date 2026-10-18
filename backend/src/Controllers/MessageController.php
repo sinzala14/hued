@@ -122,6 +122,9 @@ final class MessageController {
 
     $reply = $r->input('reply_to_id') ? Validator::int($r->input('reply_to_id'), 'reply_to_id') : null;
     if ($reply && !Database::one('SELECT 1 FROM messages WHERE id = ? AND conversation_id = ? AND deleted_at IS NULL', [$reply, $conv['id']])) $reply = null;
+    $duration = $r->input('duration_seconds') !== null && $r->input('duration_seconds') !== ''
+      ? max(0, min(3600, (int)$r->input('duration_seconds')))
+      : null;
 
     $dir = Config::get('storage') . '/message_media';
     if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) throw new ApiException('Could not save voice note', 500);
@@ -131,7 +134,7 @@ final class MessageController {
     try {
       $pdo->beginTransaction();
       $id = Database::insert('INSERT INTO messages (conversation_id, sender_id, client_id, body, reply_to_id) VALUES (?,?,?,?,?)', [$conv['id'], $me, $cid, '', $reply]);
-      Database::run('INSERT INTO message_media (message_id, path, mime, size, is_voice) VALUES (?,?,?,?,1)', [$id, $name, $mime, $f['size']]);
+      Database::run('INSERT INTO message_media (message_id, path, mime, size, is_voice, duration_seconds) VALUES (?,?,?,?,1,?)', [$id, $name, $mime, $f['size'], $duration]);
       Database::run('UPDATE conversations SET updated_at = NOW() WHERE id = ?', [$conv['id']]);
       Database::run('UPDATE conversation_members SET hidden = 0 WHERE conversation_id = ?', [$conv['id']]);
       $created = Database::one('SELECT DATE_FORMAT(created_at, "%Y-%m-%d %H:%i:%s.%f") AS created_at FROM messages WHERE id = ?', [$id])['created_at'];
@@ -145,7 +148,7 @@ final class MessageController {
     if (!$theirs || !$theirs['muted']) Notifier::send((int)$other['id'], 'message', $u['display_name'], 'Voice note',
       ['conversation_id' => (int)$conv['id'], 'message_id' => (int)$id, 'sender_id' => $me]);
     Response::ok(['message' => ['id' => $id, 'client_id' => $cid, 'sender_id' => $me, 'body' => '', 'reply_to_id' => $reply,
-      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id, 'is_voice' => true]]);
+      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id, 'is_voice' => true, 'duration_seconds' => $duration]]);
   }
 
   private function visible(int $mid, int $me): array {
