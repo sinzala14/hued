@@ -43,12 +43,21 @@ final class MessageController {
 
     $f = $_FILES['image'] ?? null;
     if (!$f || $f['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($f['tmp_name'])) throw new ApiException('Choose an image to send', 422);
-    $max = (int)Config::get('max_upload_bytes', 5 * 1024 * 1024);
-    if ($f['size'] < 1 || $f['size'] > $max) throw new ApiException('Image is too large', 422);
-    $allowed = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
+    $max = max(15 * 1024 * 1024, (int)Config::get('max_upload_bytes', 10 * 1024 * 1024));
+    if ($f['size'] < 1 || $f['size'] > $max) throw new ApiException('Image is too large (max 15 MB)', 422);
+    $allowed = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif', 'image/heic' => 'heic', 'image/heif' => 'heif'];
     $mime = (new \finfo(FILEINFO_MIME_TYPE))->file($f['tmp_name']);
+    $ext = $allowed[$mime] ?? null;
+    if (!$ext) {
+      $clientExt = strtolower(pathinfo($f['name'] ?? '', PATHINFO_EXTENSION));
+      $extMap = ['jpg' => 'jpg', 'jpeg' => 'jpg', 'png' => 'png', 'webp' => 'webp', 'gif' => 'gif', 'heic' => 'heic', 'heif' => 'heif'];
+      if (isset($extMap[$clientExt])) {
+        $ext = $extMap[$clientExt];
+        $mime = 'image/' . ($ext === 'jpg' ? 'jpeg' : $ext);
+      }
+    }
     $dim = @getimagesize($f['tmp_name']);
-    if (!isset($allowed[$mime]) || !$dim || $dim[0] > 4096 || $dim[1] > 4096) throw new ApiException('Use a JPEG, PNG or WebP image', 422);
+    if (!$ext || ($dim && ($dim[0] > 8192 || $dim[1] > 8192))) throw new ApiException('Use a supported image (JPEG, PNG or WebP)', 422);
 
     $reply = $r->input('reply_to_id') ? Validator::int($r->input('reply_to_id'), 'reply_to_id') : null;
     if ($reply && !Database::one('SELECT 1 FROM messages WHERE id = ? AND conversation_id = ? AND deleted_at IS NULL', [$reply, $conv['id']])) $reply = null;
@@ -57,7 +66,7 @@ final class MessageController {
 
     $dir = Config::get('storage') . '/message_media';
     if (!is_dir($dir) && !mkdir($dir, 0750, true) && !is_dir($dir)) throw new ApiException('Could not save image', 500);
-    $name = bin2hex(random_bytes(16)) . '.' . $allowed[$mime];
+    $name = bin2hex(random_bytes(16)) . '.' . $ext;
     if (!move_uploaded_file($f['tmp_name'], "$dir/$name")) throw new ApiException('Could not save image', 500);
     $pdo = Database::pdo();
     try {
@@ -77,7 +86,7 @@ final class MessageController {
     if (!$theirs || !$theirs['muted']) Notifier::send((int)$other['id'], 'message', $u['display_name'], Notifier::preview($body ?: 'Photo'),
       ['conversation_id' => (int)$conv['id'], 'message_id' => (int)$id, 'sender_id' => $me]);
     Response::ok(['message' => ['id' => $id, 'client_id' => $cid, 'sender_id' => $me, 'body' => $body, 'reply_to_id' => $reply,
-      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id]]);
+      'created_at' => $created, 'status' => 'sent', 'deleted' => false, 'media_id' => $id, 'is_voice' => false]]);
   }
 
   public function sendVoice(Request $r): void {
@@ -190,7 +199,11 @@ final class MessageController {
     if ((int)$m['id'] <= (int)$conv['cleared_before_id']) throw new ApiException('Not found', 404);
     $path = Config::get('storage') . '/message_media/' . basename($m['path']);
     if (!is_file($path)) throw new ApiException('Not found', 404);
-    header('Content-Type: ' . $m['mime']); header('Content-Disposition: inline'); header('Cache-Control: private, max-age=300');
+    $size = filesize($path);
+    header('Content-Type: ' . $m['mime']);
+    header('Content-Disposition: inline');
+    header('Content-Length: ' . $size);
+    header('Cache-Control: private, max-age=86400');
     readfile($path); exit;
   }
 
