@@ -76,6 +76,7 @@ try {
   $r->add('POST', '/spaces/delete',    [S::class, 'delete']);
   $r->add('POST', '/spaces/media/add', [S::class, 'addMedia']);
   $r->add('POST', '/spaces/media/delete', [S::class, 'deleteMedia']);
+  $r->add('POST', '/spaces/media/view',[S::class, 'markMediaViewed']);
   $r->add('GET',  '/spaces/media/{id}',[S::class, 'media']);
   $r->add('POST', '/spaces/impressions',[S::class, 'impress']);
   $r->add('POST', '/spaces/comments',  [S::class, 'addComment']);

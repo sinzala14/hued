@@ -126,6 +126,7 @@ CREATE TABLE spaces (
   description VARCHAR(300) NULL,
   item_count INT NOT NULL DEFAULT 0,
   access_key VARCHAR(20) NULL,
+  expires_at DATETIME NULL,
   is_hidden TINYINT(1) NOT NULL DEFAULT 0,  -- admin moderation
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -152,6 +153,7 @@ CREATE TABLE space_members (
   status ENUM('pending','approved','rejected','revoked') NOT NULL DEFAULT 'pending',
   requested_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   approved_at DATETIME NULL,
+  expires_at DATETIME NULL,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uniq_space_member (space_id, user_id),
   FOREIGN KEY (space_id) REFERENCES spaces(id) ON DELETE CASCADE,
@@ -225,6 +227,16 @@ CREATE TABLE space_views (
   FOREIGN KEY (space_id) REFERENCES spaces(id) ON DELETE CASCADE,
   FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
   INDEX (space_id, viewed_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE space_media_views (
+  media_id BIGINT UNSIGNED NOT NULL,
+  user_id BIGINT UNSIGNED NOT NULL,
+  viewed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (media_id, user_id),
+  FOREIGN KEY (media_id) REFERENCES space_media(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_user_viewed (user_id, viewed_at)
 ) ENGINE=InnoDB;
 
 CREATE TABLE blocked_users (
