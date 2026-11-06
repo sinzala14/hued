@@ -114,8 +114,8 @@ final class SpaceController {
         return false;
       }
     }
-    $vis = $space['space_visibility'] ?? 'everyone';
-    return $vis === 'everyone' || FriendController::statusBetween($viewer, $ownerId) === 'friends';
+    // Public galleries are strictly public to friends only. Non-friends cannot view.
+    return FriendController::statusBetween($viewer, $ownerId) === 'friends';
   }
 
   private function fetchMediaWithViewStatus(int $spaceId, int $viewerId): array {
@@ -179,12 +179,10 @@ final class SpaceController {
         AND NOT EXISTS (
           SELECT 1 FROM space_members sm_blk WHERE sm_blk.space_id = s.id AND sm_blk.user_id = ? AND sm_blk.status IN ('revoked', 'rejected')
         )
-        AND (
-          s.owner_id = ?
-          OR EXISTS (
-            SELECT 1 FROM friendships f WHERE f.status = 'accepted'
-              AND ((f.requester_id = o.id AND f.addressee_id = ?) OR (f.addressee_id = o.id AND f.requester_id = ?))
-          )
+        AND s.owner_id <> ?
+        AND EXISTS (
+          SELECT 1 FROM friendships f WHERE f.status = 'accepted'
+            AND ((f.requester_id = o.id AND f.addressee_id = ?) OR (f.addressee_id = o.id AND f.requester_id = ?))
         )
         AND EXISTS (SELECT 1 FROM space_media smed WHERE smed.space_id = s.id)
       ORDER BY s.updated_at DESC, s.id DESC LIMIT 60", [$uid, $uid, $uid, $uid, $uid, $uid]);
