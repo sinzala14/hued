@@ -74,6 +74,8 @@ try {
   $r->add('POST', '/spaces/create',    [S::class, 'createPublic']);
   $r->add('GET',  '/spaces/mine',      [S::class, 'mine']);
   $r->add('POST', '/spaces/delete',    [S::class, 'delete']);
+  $r->add('POST', '/spaces/update',    [S::class, 'update']);
+  $r->add('POST', '/spaces/follow',    [S::class, 'toggleFollow']);
   $r->add('POST', '/spaces/media/add', [S::class, 'addMedia']);
   $r->add('POST', '/spaces/media/delete', [S::class, 'deleteMedia']);
   $r->add('POST', '/spaces/media/view',[S::class, 'markMediaViewed']);

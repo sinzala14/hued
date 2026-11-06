@@ -3,7 +3,7 @@ namespace Hue\Controllers;
 use Hue\Core\{Request, Response, ApiException, Database, Auth, Validator, RateLimiter, Config, Notifier};
 
 final class SpaceController {
-  private const MAX_GALLERIES_PER_USER = 5;
+  private const MAX_GALLERIES_PER_USER = 20;
   private const MAX_MEDIA_PER_GALLERY  = 12;
   private static bool $schemaChecked   = false;
 
@@ -13,6 +13,7 @@ final class SpaceController {
 
     $statements = [
       "ALTER TABLE spaces ADD COLUMN access_key VARCHAR(20) NULL",
+      "ALTER TABLE spaces ADD COLUMN category VARCHAR(20) NOT NULL DEFAULT 'gallery'",
       "ALTER TABLE spaces ADD COLUMN expires_at DATETIME NULL",
       "ALTER TABLE spaces ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
       "CREATE TABLE IF NOT EXISTS space_members (
@@ -47,6 +48,13 @@ final class SpaceController {
         PRIMARY KEY (media_id, user_id),
         INDEX idx_user_viewed (user_id, viewed_at)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+      "CREATE TABLE IF NOT EXISTS space_follows (
+        space_id BIGINT UNSIGNED NOT NULL,
+        user_id BIGINT UNSIGNED NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (space_id, user_id),
+        INDEX idx_user_follows (user_id, created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
     ];
 
     foreach ($statements as $sql) {
@@ -79,6 +87,14 @@ final class SpaceController {
     if (!empty($space['expires_at']) && strtotime((string)$space['expires_at']) <= time()) {
       return false;
     }
+    try {
+      $blockedMember = Database::one(
+        "SELECT 1 FROM space_members WHERE space_id = ? AND user_id = ? AND status IN ('revoked', 'rejected')",
+        [(int)$space['id'], $viewer]
+      );
+      if ($blockedMember) return false;
+    } catch (\Throwable $e) {}
+
     $type = $space['type'] ?? 'public';
     if ($type === 'private') {
       try {
@@ -140,13 +156,13 @@ final class SpaceController {
     ];
   }
 
-  // ---------------- Friends' Galleries & Newly Added Pictures (Discover) ----------------
+  // ---------------- Public Galleries & Newly Added Pictures (Discover) ----------------
   public function listPublic(Request $r): void {
     self::ensureSchema();
     $u = Auth::user($r);
     $uid = (int)$u['id'];
-    // Discover is strictly for Friends' Public Galleries (NOT Private Key shares, which are for specific individuals only)
-    $rows = Database::all("SELECT s.id, s.owner_id, s.type, s.title, s.description, s.expires_at, s.created_at, s.updated_at,
+    // Discover displays Public Galleries (friends' public galleries + user's public galleries) and newly added pics
+    $rows = Database::all("SELECT s.id, s.owner_id, s.type, s.category, s.title, s.description, s.expires_at, s.created_at, s.updated_at,
         GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
         o.display_name AS owner_name, o.code AS owner_code, o.personal_color AS owner_color,
         (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_media_id,
@@ -160,18 +176,25 @@ final class SpaceController {
         AND (s.expires_at IS NULL OR s.expires_at > NOW())
         AND s.owner_id NOT IN (SELECT blocked_id FROM blocked_users WHERE user_id = ?)
         AND s.owner_id NOT IN (SELECT user_id FROM blocked_users WHERE blocked_id = ?)
-        AND EXISTS (
-          SELECT 1 FROM friendships f WHERE f.status = 'accepted'
-            AND ((f.requester_id = o.id AND f.addressee_id = ?) OR (f.addressee_id = o.id AND f.requester_id = ?))
+        AND NOT EXISTS (
+          SELECT 1 FROM space_members sm_blk WHERE sm_blk.space_id = s.id AND sm_blk.user_id = ? AND sm_blk.status IN ('revoked', 'rejected')
+        )
+        AND (
+          s.owner_id = ?
+          OR EXISTS (
+            SELECT 1 FROM friendships f WHERE f.status = 'accepted'
+              AND ((f.requester_id = o.id AND f.addressee_id = ?) OR (f.addressee_id = o.id AND f.requester_id = ?))
+          )
         )
         AND EXISTS (SELECT 1 FROM space_media smed WHERE smed.space_id = s.id)
-      ORDER BY s.updated_at DESC, s.id DESC LIMIT 60", [$uid, $uid, $uid, $uid]);
+      ORDER BY s.updated_at DESC, s.id DESC LIMIT 60", [$uid, $uid, $uid, $uid, $uid, $uid]);
 
     $recentPics = [];
     foreach ($rows as &$s) {
       $isOwner = (int)$s['owner_id'] === $uid;
       $s['id'] = (int)$s['id'];
       $s['owner_id'] = (int)$s['owner_id'];
+      $s['category'] = $s['category'] ?? 'gallery';
       $s['media_count'] = (int)$s['media_count'];
       $s['cover_media_id'] = $s['cover_media_id'] ? (int)$s['cover_media_id'] : null;
       $s['seconds_left'] = $s['expires_at'] ? (int)$s['seconds_left'] : null;
@@ -188,19 +211,26 @@ final class SpaceController {
 
       foreach ($s['media'] as $idx => $mItem) {
         if (str_starts_with((string)$mItem['mime'], 'video/')) continue;
+        $mId = (int)$mItem['id'];
         $recentPics[] = [
-          'media_id'    => $mItem['id'],
-          'media_index' => $idx,
-          'space_id'    => $s['id'],
-          'space_title' => $s['title'],
-          'space_type'  => $s['type'],
-          'owner_id'    => $s['owner_id'],
-          'owner_name'  => $s['owner_name'],
-          'owner_color' => $s['owner_color'],
-          'viewed'      => $mItem['viewed'],
-          'created_at'  => $mItem['created_at'],
+          'media_id'       => $mId,
+          'media_index'    => $idx,
+          'space_id'       => $s['id'],
+          'space_title'    => $s['title'],
+          'space_type'     => $s['type'],
+          'owner_id'       => $s['owner_id'],
+          'owner_name'     => $s['owner_name'],
+          'owner_color'    => $s['owner_color'],
+          'is_owner'       => $isOwner,
+          'viewed'         => $mItem['viewed'],
+          'created_at'     => $mItem['created_at'],
+          'likes_count'    => (int)($s['impressions'] ?? 0),
+          'comments_count' => (int)(Database::one('SELECT COUNT(*) AS c FROM space_comments WHERE media_id = ?', [$mId])['c'] ?? 0),
         ];
       }
+
+      $s['is_following'] = (bool)Database::one('SELECT 1 FROM space_follows WHERE space_id = ? AND user_id = ?', [$s['id'], $uid]);
+      $s['followers_count'] = (int)(Database::one('SELECT COUNT(*) AS c FROM space_follows WHERE space_id = ?', [$s['id']])['c'] ?? 0);
 
       if ($isOwner) {
         $s['is_owner'] = true;
@@ -214,12 +244,14 @@ final class SpaceController {
     }
     unset($s);
 
-    // Sort galleries: friends' galleries with NEW (unviewed) pictures first, then newest activity
+    // Sort galleries: friends' galleries with NEW (unviewed) pictures first, then friends' galleries, then newest activity
     usort($rows, function (array $a, array $b): int {
-      $aNew = ($a['new_count'] ?? 0) > 0 ? 1 : 0;
-      $bNew = ($b['new_count'] ?? 0) > 0 ? 0 : 0;
-      $bNew = ($b['new_count'] ?? 0) > 0 ? 1 : 0;
+      $aFriend = empty($a['is_owner']) ? 1 : 0;
+      $bFriend = empty($b['is_owner']) ? 1 : 0;
+      $aNew = ($a['new_count'] ?? 0) > 0 && $aFriend ? 1 : 0;
+      $bNew = ($b['new_count'] ?? 0) > 0 && $bFriend ? 1 : 0;
       if ($aNew !== $bNew) return $bNew <=> $aNew;
+      if ($aFriend !== $bFriend) return $bFriend <=> $aFriend;
       return strcmp((string)($b['latest_media_at'] ?? ''), (string)($a['latest_media_at'] ?? ''));
     });
 
@@ -232,14 +264,18 @@ final class SpaceController {
     });
     $recentPics = array_slice($recentPics, 0, 24);
 
-    Response::ok(['spaces' => $rows, 'recent_pics' => $recentPics]);
+    $followedSpaces = array_values(array_filter($rows, function ($sp) {
+      return !empty($sp['is_following']);
+    }));
+
+    Response::ok(['spaces' => $rows, 'recent_pics' => $recentPics, 'followed_spaces' => $followedSpaces]);
   }
 
   public function show(Request $r, array $p): void {
     self::ensureSchema();
     $u = Auth::user($r);
     $uid = (int)$u['id'];
-    $s = Database::one("SELECT s.id, s.owner_id, s.type, s.title, s.description, s.access_key, s.expires_at, s.created_at,
+    $s = Database::one("SELECT s.id, s.owner_id, s.type, s.category, s.title, s.description, s.access_key, s.expires_at, s.created_at,
         GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
         o.space_visibility, o.display_name AS owner_name, o.code AS owner_code, o.personal_color AS owner_color
         FROM spaces s JOIN users o ON o.id = s.owner_id
@@ -249,6 +285,7 @@ final class SpaceController {
     $sid = (int)$s['id'];
     $s['id'] = $sid;
     $s['owner_id'] = (int)$s['owner_id'];
+    $s['category'] = $s['category'] ?? 'gallery';
     $s['seconds_left'] = $s['expires_at'] ? (int)$s['seconds_left'] : null;
     $isOwner = $s['owner_id'] === $uid;
     if (!$isOwner) {
@@ -267,6 +304,9 @@ final class SpaceController {
 
     $mine = Database::one('SELECT kind FROM space_impressions WHERE space_id = ? AND user_id = ?', [$sid, $uid]);
     $s['my_impression'] = $mine['kind'] ?? null;
+    $s['is_following'] = (bool)Database::one('SELECT 1 FROM space_follows WHERE space_id = ? AND user_id = ?', [$sid, $uid]);
+    $s['followers_count'] = (int)(Database::one('SELECT COUNT(*) AS c FROM space_follows WHERE space_id = ?', [$sid])['c'] ?? 0);
+    $s['impressions'] = (int)(Database::one('SELECT COUNT(*) AS total FROM space_impressions WHERE space_id = ?', [$sid])['total'] ?? 0);
 
     if ($isOwner) {
       $s['is_owner'] = true;
@@ -275,7 +315,6 @@ final class SpaceController {
         Database::run('UPDATE spaces SET access_key = ? WHERE id = ?', [$s['access_key'], $sid]);
       }
       $s['views'] = (int)(Database::one('SELECT COUNT(*) AS total FROM space_views WHERE space_id = ?', [$sid])['total'] ?? 0);
-      $s['impressions'] = (int)(Database::one('SELECT COUNT(*) AS total FROM space_impressions WHERE space_id = ?', [$sid])['total'] ?? 0);
       $s['impression_summary'] = Database::all('SELECT kind, COUNT(*) AS total FROM space_impressions WHERE space_id = ? GROUP BY kind ORDER BY total DESC', [$sid]);
       $s['likers'] = Database::all(
         'SELECT i.kind, i.created_at, u.id AS user_id, u.display_name, u.code, u.personal_color
@@ -295,19 +334,17 @@ final class SpaceController {
       } catch (\Throwable $e) {
         $s['comments'] = [];
       }
-      if ($s['type'] === 'private') {
-        try {
-          $s['members'] = Database::all(
-            "SELECT m.id AS member_id, m.user_id, m.status, m.requested_at, m.approved_at, m.expires_at,
-                    u.display_name, u.code, u.personal_color
-             FROM space_members m JOIN users u ON u.id = m.user_id
-             WHERE m.space_id = ?
-             ORDER BY FIELD(m.status, 'pending', 'approved', 'rejected', 'revoked'), m.requested_at DESC",
-            [$sid]
-          );
-        } catch (\Throwable $e) {
-          $s['members'] = [];
-        }
+      try {
+        $s['members'] = Database::all(
+          "SELECT m.id AS member_id, m.id AS request_id, m.space_id, m.user_id, m.status, m.requested_at, m.approved_at, m.expires_at,
+                  u.display_name, u.display_name AS user_name, u.code, u.code AS user_code, u.personal_color, u.personal_color AS user_color
+           FROM space_members m JOIN users u ON u.id = m.user_id
+           WHERE m.space_id = ?
+           ORDER BY FIELD(m.status, 'approved', 'pending', 'revoked', 'rejected'), m.requested_at DESC",
+          [$sid]
+        );
+      } catch (\Throwable $e) {
+        $s['members'] = [];
       }
     } else {
       $s['is_owner'] = false;
@@ -364,8 +401,8 @@ final class SpaceController {
     self::ensureSchema();
     $u = Auth::user($r);
     $uid = (int)$u['id'];
-    // Active galleries that have media (or created galleries)
-    $spaces = Database::all("SELECT s.id, s.owner_id, s.type, s.title, s.description, s.item_count, s.access_key, s.expires_at, s.created_at,
+    // Active galleries and private pics owned by this user
+    $spaces = Database::all("SELECT s.id, s.owner_id, s.type, s.category, s.title, s.description, s.item_count, s.access_key, s.expires_at, s.created_at,
         GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
         (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_media_id,
         (SELECT mime FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_mime,
@@ -381,6 +418,7 @@ final class SpaceController {
       $sid = (int)$s['id'];
       $s['id'] = $sid;
       $s['owner_id'] = $uid;
+      $s['category'] = $s['category'] ?? 'gallery';
       $s['owner_name'] = $u['display_name'] ?? 'You';
       $s['owner_color'] = $u['personal_color'] ?? '#7C5CFF';
       $s['is_owner'] = true;
@@ -393,16 +431,35 @@ final class SpaceController {
       $s['views'] = (int)$s['views'];
       $s['impressions'] = (int)$s['impressions'];
       try {
-        $s['comment_count'] = (int)(Database::one('SELECT COUNT(*) AS c FROM space_comments WHERE space_id = ?', [$sid])['c'] ?? 0);
+        $s['comments'] = Database::all(
+          'SELECT c.id, c.media_id, c.user_id, c.body, c.owner_reply, c.replied_at, c.created_at,
+                  u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+           FROM space_comments c JOIN users u ON u.id = c.user_id
+           WHERE c.space_id = ? ORDER BY c.created_at DESC',
+          [$sid]
+        );
+        $s['comment_count'] = count($s['comments']);
       } catch (\Throwable $e) {
+        $s['comments'] = [];
         $s['comment_count'] = 0;
       }
       try {
+        $s['members'] = Database::all(
+          "SELECT sm.id AS request_id, sm.space_id, sm.user_id, sm.status, sm.requested_at, sm.approved_at,
+                  u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+           FROM space_members sm JOIN users u ON u.id = sm.user_id
+           WHERE sm.space_id = ?
+           ORDER BY FIELD(sm.status, 'approved', 'pending', 'revoked', 'rejected'), sm.requested_at DESC",
+          [$sid]
+        );
         $s['pending_requests'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status = 'pending'", [$sid])['c'] ?? 0);
         $s['approved_members'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status = 'approved'", [$sid])['c'] ?? 0);
+        $s['blocked_members'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status IN ('revoked', 'rejected')", [$sid])['c'] ?? 0);
       } catch (\Throwable $e) {
+        $s['members'] = [];
         $s['pending_requests'] = 0;
         $s['approved_members'] = 0;
+        $s['blocked_members'] = 0;
       }
       $s['impression_summary'] = Database::all('SELECT kind, COUNT(*) AS total FROM space_impressions WHERE space_id = ? GROUP BY kind ORDER BY total DESC', [$sid]);
       $meta = $this->fetchMediaWithViewStatus($sid, $uid);
@@ -412,10 +469,10 @@ final class SpaceController {
     }
     unset($s);
 
-    // Galleries from others where this user has requested or been granted access via Private Key
+    // Galleries/Private Pics from others where this user has been granted access via Key
     $joined = [];
     try {
-      $joined = Database::all("SELECT s.id, s.owner_id, s.type, s.title, s.description, s.expires_at,
+      $joined = Database::all("SELECT s.id, s.owner_id, s.type, s.category, s.title, s.description, s.expires_at,
           GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
           sm.status AS member_status, sm.requested_at, sm.approved_at,
           o.display_name AS owner_name, o.code AS owner_code, o.personal_color AS owner_color,
@@ -430,9 +487,22 @@ final class SpaceController {
       foreach ($joined as &$j) {
         $j['id'] = (int)$j['id'];
         $j['owner_id'] = (int)$j['owner_id'];
+        $j['category'] = $j['category'] ?? 'gallery';
         $j['media_count'] = (int)$j['media_count'];
         $j['seconds_left'] = $j['expires_at'] ? (int)$j['seconds_left'] : null;
-        if ($j['member_status'] === 'approved') {
+        try {
+          // Viewer strictly sees ONLY their own replies & the owner's reply to them
+          $j['my_comments'] = Database::all(
+            'SELECT c.id, c.media_id, c.user_id, c.body, c.owner_reply, c.replied_at, c.created_at,
+                    u.display_name AS user_name, u.personal_color AS user_color
+             FROM space_comments c JOIN users u ON u.id = c.user_id
+             WHERE c.space_id = ? AND c.user_id = ? ORDER BY c.created_at DESC',
+            [$j['id'], $uid]
+          );
+        } catch (\Throwable $e) {
+          $j['my_comments'] = [];
+        }
+        if ($j['member_status'] === 'approved' && ($j['seconds_left'] === null || $j['seconds_left'] > 0)) {
           $meta = $this->fetchMediaWithViewStatus($j['id'], $uid);
           $j['media'] = $meta['media'];
           $j['cover_media_id'] = !empty($j['media']) ? (int)$j['media'][0]['id'] : null;
@@ -446,16 +516,16 @@ final class SpaceController {
       $joined = [];
     }
 
-    // Incoming requests across all of the user's private galleries
+    // All members / blocked users across the user's private galleries & private pics
     $incoming = [];
     try {
       $incoming = Database::all("SELECT sm.id AS request_id, sm.space_id, sm.user_id, sm.status, sm.requested_at, sm.approved_at,
-          s.title AS space_title, u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+          s.title AS space_title, s.category AS space_category, u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
         FROM space_members sm
         JOIN spaces s ON s.id = sm.space_id
         JOIN users u ON u.id = sm.user_id
         WHERE s.owner_id = ? AND s.deleted_at IS NULL
-        ORDER BY FIELD(sm.status, 'pending', 'approved', 'rejected', 'revoked'), sm.requested_at DESC", [$uid]);
+        ORDER BY FIELD(sm.status, 'approved', 'pending', 'revoked', 'rejected'), sm.requested_at DESC", [$uid]);
     } catch (\Throwable $e) {
       $incoming = [];
     }
@@ -490,12 +560,19 @@ final class SpaceController {
     )['c'] ?? 0);
 
     if ($activeCount >= self::MAX_GALLERIES_PER_USER) {
-      throw new ApiException('You can have up to ' . self::MAX_GALLERIES_PER_USER . ' Hue Galleries. Delete one to create a new gallery.', 422);
+      throw new ApiException('You can have up to ' . self::MAX_GALLERIES_PER_USER . ' active galleries/private pics. Delete one to create a new one.', 422);
     }
 
-    $title = Validator::str($r->input('title'), 'Title', 1, 80);
-    $typeInput = strtolower(trim((string)$r->input('type', 'public')));
-    $type = in_array($typeInput, ['public', 'private'], true) ? $typeInput : 'public';
+    $catInput = strtolower(trim((string)$r->input('category', 'gallery')));
+    $category = in_array($catInput, ['gallery', 'private_pic'], true) ? $catInput : 'gallery';
+    $typeInput = strtolower(trim((string)$r->input('type', $category === 'private_pic' ? 'private' : 'public')));
+    $type = $category === 'private_pic' ? 'private' : (in_array($typeInput, ['public', 'private'], true) ? $typeInput : 'public');
+
+    $rawTitle = trim((string)$r->input('title', ''));
+    if ($rawTitle === '' && $category === 'private_pic') {
+      $rawTitle = 'Private Pic';
+    }
+    $title = Validator::str($rawTitle, 'Title', 1, 80);
     $desc = mb_substr(trim((string)$r->input('description', '')), 0, 300);
 
     $files = $_FILES['images'] ?? null;
@@ -504,23 +581,27 @@ final class SpaceController {
       $video = $_FILES['video']; $isVideo = true;
       $files = ['name' => [$video['name']], 'type' => [$video['type']], 'tmp_name' => [$video['tmp_name']], 'error' => [$video['error']], 'size' => [$video['size']]];
     }
-    if (!$files || !is_array($files['name'])) throw new ApiException('Add your favourite pictures to create the gallery', 422);
+    if (!$files || !is_array($files['name'])) throw new ApiException('Choose at least one picture', 422);
+    if ($category === 'private_pic' && count($files['name']) > 3) {
+      throw new ApiException('A private view pic allows up to 3 pictures maximum', 422);
+    }
     if (count($files['name']) > self::MAX_MEDIA_PER_GALLERY) {
       throw new ApiException('A Hue Gallery holds up to ' . self::MAX_MEDIA_PER_GALLERY . ' items', 422);
     }
 
     $accessKey = $type === 'private' ? self::generateAccessKey() : null;
-    $durationMinutes = (int)$r->input('duration_minutes', $type === 'private' ? 4320 : 0);
+    $defaultDuration = $category === 'private_pic' ? 1440 : 0;
+    $durationMinutes = (int)$r->input('duration_minutes', $defaultDuration);
     if ($durationMinutes > 0) {
       $durationMinutes = max(5, min(43200, $durationMinutes)); // 5 min to 30 days
       $sid = Database::insert(
-        "INSERT INTO spaces (owner_id, type, title, description, access_key, expires_at) VALUES (?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))",
-        [$uid, $type, $title, $desc, $accessKey, $durationMinutes]
+        "INSERT INTO spaces (owner_id, type, category, title, description, access_key, expires_at) VALUES (?, ?, ?, ?, ?, ?, DATE_ADD(NOW(), INTERVAL ? MINUTE))",
+        [$uid, $type, $category, $title, $desc, $accessKey, $durationMinutes]
       );
     } else {
       $sid = Database::insert(
-        "INSERT INTO spaces (owner_id, type, title, description, access_key) VALUES (?, ?, ?, ?, ?)",
-        [$uid, $type, $title, $desc, $accessKey]
+        "INSERT INTO spaces (owner_id, type, category, title, description, access_key) VALUES (?, ?, ?, ?, ?, ?)",
+        [$uid, $type, $category, $title, $desc, $accessKey]
       );
     }
 
@@ -533,6 +614,7 @@ final class SpaceController {
     Response::ok([
       'space_id'         => (int)$sid,
       'type'             => $type,
+      'category'         => $category,
       'access_key'       => $accessKey,
       'duration_minutes' => $durationMinutes,
     ]);
@@ -544,7 +626,7 @@ final class SpaceController {
     $uid = (int)$u['id'];
     RateLimiter::hit('upload:' . $uid, 30, 3600);
     $sid = Validator::int($r->input('space_id'), 'space_id');
-    $s = Database::one('SELECT id, type FROM spaces WHERE id = ? AND owner_id = ? AND deleted_at IS NULL', [$sid, $uid]);
+    $s = Database::one('SELECT id, type, title FROM spaces WHERE id = ? AND owner_id = ? AND deleted_at IS NULL', [$sid, $uid]);
     if (!$s) throw new ApiException('Gallery not found', 404);
 
     $existingCount = (int)(Database::one('SELECT COUNT(*) AS c FROM space_media WHERE space_id = ?', [$sid])['c'] ?? 0);
@@ -560,7 +642,55 @@ final class SpaceController {
 
     $newCount = (int)(Database::one('SELECT COUNT(*) AS c FROM space_media WHERE space_id = ?', [$sid])['c'] ?? 0);
     Database::run('UPDATE spaces SET item_count = ?, updated_at = NOW() WHERE id = ?', [$newCount, $sid]);
+
+    // Send notifications to followers on updated space gallery
+    try {
+      $followers = Database::column('SELECT user_id FROM space_follows WHERE space_id = ? AND user_id != ?', [$sid, $uid]);
+      foreach ($followers as $fid) {
+        Notifier::send(
+          (int)$fid,
+          'space_updated',
+          $u['display_name'] . ' added new pics to ' . $s['title'],
+          $saved . ' newly added pic(s) are now in ' . $s['title'],
+          ['space_id' => $sid]
+        );
+      }
+    } catch (\Throwable $e) {}
+
     Response::ok(['added' => $saved, 'media_count' => $newCount]);
+  }
+
+  public function update(Request $r): void {
+    self::ensureSchema();
+    $u = Auth::user($r);
+    $uid = (int)$u['id'];
+    $sid = Validator::int($r->input('space_id'), 'space_id');
+    $title = trim((string)$r->input('title', ''));
+    $desc = mb_substr(trim((string)$r->input('description', '')), 0, 300);
+    $s = Database::one('SELECT id, owner_id FROM spaces WHERE id = ? AND owner_id = ? AND deleted_at IS NULL', [$sid, $uid]);
+    if (!$s) throw new ApiException('Gallery not found', 404);
+    if ($title === '') throw new ApiException('Title cannot be empty', 422);
+    Database::run('UPDATE spaces SET title = ?, description = ?, updated_at = NOW() WHERE id = ?', [$title, $desc, $sid]);
+    Response::ok(['space_id' => $sid, 'title' => $title, 'description' => $desc]);
+  }
+
+  public function toggleFollow(Request $r): void {
+    self::ensureSchema();
+    $u = Auth::user($r);
+    $uid = (int)$u['id'];
+    $sid = Validator::int($r->input('space_id'), 'space_id');
+    $s = Database::one('SELECT id, owner_id, title FROM spaces WHERE id = ? AND deleted_at IS NULL', [$sid]);
+    if (!$s) throw new ApiException('Gallery not found', 404);
+    $exists = Database::one('SELECT 1 FROM space_follows WHERE space_id = ? AND user_id = ?', [$sid, $uid]);
+    if ($exists) {
+      Database::run('DELETE FROM space_follows WHERE space_id = ? AND user_id = ?', [$sid, $uid]);
+      $following = false;
+    } else {
+      Database::run('INSERT IGNORE INTO space_follows (space_id, user_id) VALUES (?, ?)', [$sid, $uid]);
+      $following = true;
+    }
+    $count = (int)(Database::one('SELECT COUNT(*) AS c FROM space_follows WHERE space_id = ?', [$sid])['c'] ?? 0);
+    Response::ok(['space_id' => $sid, 'following' => $following, 'followers_count' => $count]);
   }
 
   public function deleteMedia(Request $r): void {
@@ -784,26 +914,53 @@ final class SpaceController {
     Response::ok();
   }
 
-  // ---------------- Private Gallery Access Keys & Approval Workflow ----------------
+  // ---------------- Private Gallery / Private Pic Access Keys & User Blocking ----------------
   public function createKey(Request $r): void {
     self::ensureSchema();
     $u = Auth::user($r);
     RateLimiter::hit('key:' . $u['id'], 30, 3600);
     $sid = Validator::int($r->input('space_id'), 'space_id');
     $s = $this->ownedPrivate((int)$u['id'], $sid);
-    $rotate = $r->input('rotate', false) ? true : empty($s['access_key']);
-    $newKey = $rotate ? self::generateAccessKey() : (string)$s['access_key'];
-    $minutes = (int)$r->input('duration_minutes', $r->input('minutes', 4320));
-    if ($minutes > 0) {
-      $minutes = max(5, min(43200, $minutes));
-      Database::run(
-        'UPDATE spaces SET access_key = ?, expires_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE id = ?',
-        [$newKey, $minutes, $s['id']]
-      );
-      $secondsLeft = $minutes * 60;
+
+    $customRaw = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string)$r->input('custom_key', '')));
+    $rotate = $r->input('rotate', false) ? true : (empty($s['access_key']) || $customRaw !== '');
+    if ($customRaw !== '') {
+      if (strlen($customRaw) < 6 || strlen($customRaw) > 12) {
+        throw new ApiException('Custom key must be 6 to 12 letters/numbers', 422);
+      }
+      $newKey = strlen($customRaw) === 8 ? substr($customRaw, 0, 4) . '-' . substr($customRaw, 4) : $customRaw;
+      $dup = Database::one('SELECT id FROM spaces WHERE access_key = ? AND id != ? AND deleted_at IS NULL', [$newKey, $sid]);
+      if ($dup) throw new ApiException('That key is already in use. Choose another key.', 422);
     } else {
-      Database::run('UPDATE spaces SET access_key = ?, expires_at = NULL WHERE id = ?', [$newKey, $s['id']]);
-      $secondsLeft = null;
+      $newKey = $rotate ? self::generateAccessKey() : (string)$s['access_key'];
+    }
+
+    // When key is changed, require non-blocked users to enter the new key while keeping blocked ('revoked'/'rejected') users blocked
+    $resetUsers = $r->input('reset_users', $rotate);
+    if ($rotate && $resetUsers) {
+      try {
+        Database::run("DELETE FROM space_members WHERE space_id = ? AND status IN ('approved', 'pending')", [$sid]);
+      } catch (\Throwable $e) {}
+    }
+
+    $hasDurationParam = $r->input('duration_minutes') !== null || $r->input('minutes') !== null;
+    if ($hasDurationParam) {
+      $minutes = (int)$r->input('duration_minutes', $r->input('minutes', 0));
+      if ($minutes > 0) {
+        $minutes = max(5, min(43200, $minutes));
+        Database::run(
+          'UPDATE spaces SET access_key = ?, expires_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE id = ?',
+          [$newKey, $minutes, $s['id']]
+        );
+        $secondsLeft = $minutes * 60;
+      } else {
+        Database::run('UPDATE spaces SET access_key = ?, expires_at = NULL WHERE id = ?', [$newKey, $s['id']]);
+        $secondsLeft = null;
+      }
+    } else {
+      Database::run('UPDATE spaces SET access_key = ? WHERE id = ?', [$newKey, $s['id']]);
+      $secondsLeft = !empty($s['expires_at']) ? max(0, strtotime((string)$s['expires_at']) - time()) : null;
+      $minutes = $secondsLeft !== null ? (int)ceil($secondsLeft / 60) : 0;
     }
     Response::ok(['key' => $newKey, 'access_key' => $newKey, 'seconds_left' => $secondsLeft, 'duration_minutes' => $minutes]);
   }
@@ -816,11 +973,11 @@ final class SpaceController {
     RateLimiter::hit('redeem-ip:' . $r->ip(), 30, 600);
 
     $rawKey = strtoupper(preg_replace('/[^A-Za-z0-9]/', '', (string)$r->input('key', '')));
-    if (strlen($rawKey) < 6) throw new ApiException('Enter a valid Hue Gallery Key', 422);
+    if (strlen($rawKey) < 6) throw new ApiException('Enter a valid Private Key', 422);
     $formatted = strlen($rawKey) === 8 ? substr($rawKey, 0, 4) . '-' . substr($rawKey, 4) : $rawKey;
 
     $s = Database::one(
-      "SELECT s.id, s.title, s.owner_id, s.item_count, s.expires_at, o.display_name AS owner_name
+      "SELECT s.id, s.title, s.category, s.owner_id, s.item_count, s.expires_at, o.display_name AS owner_name
        FROM spaces s JOIN users o ON o.id = s.owner_id
        WHERE (s.access_key = ? OR s.access_key = ?) AND s.type = 'private' AND s.deleted_at IS NULL AND o.is_banned = 0",
       [$formatted, $rawKey]
@@ -828,52 +985,41 @@ final class SpaceController {
 
     if ($s) {
       if (!empty($s['expires_at']) && strtotime((string)$s['expires_at']) <= time()) {
-        throw new ApiException('This private gallery key has expired', 410);
+        throw new ApiException('This private key has expired', 410);
       }
       $sid = (int)$s['id'];
       $ownerId = (int)$s['owner_id'];
-      if ($ownerId === $uid) throw new ApiException('This is your own gallery key', 422);
-      if (UserController::blocked($uid, $ownerId)) throw new ApiException('That key is invalid or unavailable', 404);
+      if ($ownerId === $uid) throw new ApiException('This is your own private key', 422);
+      if (UserController::blocked($uid, $ownerId)) throw new ApiException('You cannot access this private gallery', 403);
 
       $existing = Database::one('SELECT id, status FROM space_members WHERE space_id = ? AND user_id = ?', [$sid, $uid]);
-      if ($existing && $existing['status'] === 'approved') {
-        Response::ok([
-          'status'     => 'approved',
-          'space_id'   => $sid,
-          'title'      => $s['title'],
-          'owner_name' => $s['owner_name'],
-          'message'    => 'You already have access to this gallery.',
-        ]);
-      }
-      if ($existing && $existing['status'] === 'pending') {
-        Response::ok([
-          'status'     => 'pending',
-          'space_id'   => $sid,
-          'title'      => $s['title'],
-          'owner_name' => $s['owner_name'],
-          'message'    => 'Request already sent! Waiting for ' . $s['owner_name'] . ' to accept.',
-        ]);
+      if ($existing && in_array($existing['status'], ['revoked', 'rejected'], true)) {
+        throw new ApiException('Access to this private gallery has been blocked by the owner', 403);
       }
 
+      $wasApproved = $existing && $existing['status'] === 'approved';
       Database::run(
         "INSERT INTO space_members (space_id, user_id, status, requested_at, approved_at)
-         VALUES (?, ?, 'pending', NOW(), NULL)
-         ON DUPLICATE KEY UPDATE status = 'pending', requested_at = NOW(), approved_at = NULL",
+         VALUES (?, ?, 'approved', NOW(), NOW())
+         ON DUPLICATE KEY UPDATE status = 'approved', approved_at = NOW()",
         [$sid, $uid]
       );
-      Notifier::send(
-        $ownerId,
-        'space_access_request',
-        'Gallery Access Request',
-        $u['display_name'] . ' used your key to request access to "' . $s['title'] . '"',
-        ['space_id' => $sid, 'user_id' => $uid]
-      );
+      if (!$wasApproved) {
+        Notifier::send(
+          $ownerId,
+          'space_access_approved',
+          'Private Key Accessed',
+          $u['display_name'] . ' unlocked "' . $s['title'] . '" with your key',
+          ['space_id' => $sid, 'user_id' => $uid]
+        );
+      }
       Response::ok([
-        'status'     => 'pending',
+        'status'     => 'approved',
         'space_id'   => $sid,
+        'category'   => $s['category'] ?? 'gallery',
         'title'      => $s['title'],
         'owner_name' => $s['owner_name'],
-        'message'    => 'Request sent to ' . $s['owner_name'] . '! Once accepted, pictures will be downloaded to your Hue gallery.',
+        'message'    => 'Unlocked "' . $s['title'] . '"!',
       ]);
     }
 
@@ -881,7 +1027,7 @@ final class SpaceController {
     $k = Database::one("SELECT k.id, k.space_id, k.expires_at, s.title, s.item_count, s.owner_id, UNIX_TIMESTAMP(k.expires_at) - UNIX_TIMESTAMP(NOW()) AS seconds_left
         FROM space_access_keys k JOIN spaces s ON s.id = k.space_id
         WHERE k.key_hash = ? AND k.revoked_at IS NULL AND k.expires_at > NOW() AND s.deleted_at IS NULL", [hash('sha256', $rawKey)]);
-    if (!$k) throw new ApiException('That gallery key is invalid or has been rotated', 404);
+    if (!$k) throw new ApiException('That key is invalid or has been changed by the owner', 404);
     if ((int)$k['owner_id'] === $uid || UserController::blocked($uid, (int)$k['owner_id'])) throw new ApiException('That key is invalid or has expired', 404);
     Database::run('INSERT INTO space_grants (space_id, key_id, viewer_id, expires_at) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE revoked_at = NULL', [$k['space_id'], $k['id'], $uid, $k['expires_at']]);
     $g = Database::one('SELECT id FROM space_grants WHERE key_id = ? AND viewer_id = ?', [$k['id'], $uid]);
@@ -894,12 +1040,14 @@ final class SpaceController {
     $u = Auth::user($r);
     $uid = (int)$u['id'];
 
-    // Private Key shares owned by this user (specifically for selected individuals)
+    // Private Key shares owned by this user
     $myPrivateKeys = [];
     try {
-      $myPrivateKeys = Database::all("SELECT s.id, s.owner_id, s.type, s.title, s.description, s.access_key, s.expires_at, s.created_at,
+      $myPrivateKeys = Database::all("SELECT s.id, s.owner_id, s.type, s.category, s.title, s.description, s.access_key, s.expires_at, s.created_at,
           GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
-          (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_media_id
+          (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_media_id,
+          (SELECT COUNT(*) FROM space_views v WHERE v.space_id = s.id) AS views,
+          (SELECT COUNT(*) FROM space_impressions i WHERE i.space_id = s.id) AS impressions
         FROM spaces s
         WHERE s.owner_id = ? AND s.type = 'private' AND s.deleted_at IS NULL
           AND (EXISTS (SELECT 1 FROM space_media smed WHERE smed.space_id = s.id) OR s.access_key IS NOT NULL)
@@ -908,9 +1056,12 @@ final class SpaceController {
         $sid = (int)$pk['id'];
         $pk['id'] = $sid;
         $pk['owner_id'] = $uid;
+        $pk['category'] = $pk['category'] ?? 'gallery';
         $pk['owner_name'] = $u['display_name'] ?? 'You';
         $pk['owner_color'] = $u['personal_color'] ?? '#7C5CFF';
         $pk['is_owner'] = true;
+        $pk['views'] = (int)($pk['views'] ?? 0);
+        $pk['impressions'] = (int)($pk['impressions'] ?? 0);
         if (empty($pk['access_key'])) {
           $pk['access_key'] = self::generateAccessKey();
           Database::run('UPDATE spaces SET access_key = ? WHERE id = ?', [$pk['access_key'], $sid]);
@@ -922,11 +1073,45 @@ final class SpaceController {
         $pk['media_count'] = count($pk['media']);
         $pk['cover_media_id'] = !empty($pk['media']) ? (int)$pk['media'][0]['id'] : ($pk['cover_media_id'] ? (int)$pk['cover_media_id'] : null);
         try {
+          $pk['comments'] = Database::all(
+            'SELECT c.id, c.media_id, c.user_id, c.body, c.owner_reply, c.replied_at, c.created_at,
+                    u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+             FROM space_comments c JOIN users u ON u.id = c.user_id
+             WHERE c.space_id = ? ORDER BY c.created_at DESC',
+            [$sid]
+          );
+          $pk['comment_count'] = count($pk['comments']);
+        } catch (\Throwable $e) {
+          $pk['comments'] = [];
+          $pk['comment_count'] = 0;
+        }
+        try {
+          $pk['likers'] = Database::all(
+            'SELECT i.kind, i.created_at, u.id AS user_id, u.display_name, u.code, u.personal_color
+             FROM space_impressions i JOIN users u ON u.id = i.user_id
+             WHERE i.space_id = ? ORDER BY i.created_at DESC',
+            [$sid]
+          );
+        } catch (\Throwable $e) {
+          $pk['likers'] = [];
+        }
+        try {
+          $pk['members'] = Database::all(
+            "SELECT sm.id AS request_id, sm.space_id, sm.user_id, sm.status, sm.requested_at, sm.approved_at,
+                    u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+             FROM space_members sm JOIN users u ON u.id = sm.user_id
+             WHERE sm.space_id = ?
+             ORDER BY FIELD(sm.status, 'approved', 'pending', 'revoked', 'rejected'), sm.requested_at DESC",
+            [$sid]
+          );
           $pk['pending_requests'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status = 'pending'", [$sid])['c'] ?? 0);
           $pk['approved_members'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status = 'approved'", [$sid])['c'] ?? 0);
+          $pk['blocked_members'] = (int)(Database::one("SELECT COUNT(*) AS c FROM space_members WHERE space_id = ? AND status IN ('revoked', 'rejected')", [$sid])['c'] ?? 0);
         } catch (\Throwable $e) {
+          $pk['members'] = [];
           $pk['pending_requests'] = 0;
           $pk['approved_members'] = 0;
+          $pk['blocked_members'] = 0;
         }
       }
       unset($pk);
@@ -937,12 +1122,12 @@ final class SpaceController {
     $incoming = [];
     try {
       $incoming = Database::all("SELECT sm.id AS request_id, sm.space_id, sm.user_id, sm.status, sm.requested_at, sm.approved_at,
-          s.title AS space_title, u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
+          s.title AS space_title, s.category AS space_category, u.display_name AS user_name, u.code AS user_code, u.personal_color AS user_color
         FROM space_members sm
         JOIN spaces s ON s.id = sm.space_id
         JOIN users u ON u.id = sm.user_id
         WHERE s.owner_id = ? AND s.deleted_at IS NULL
-        ORDER BY FIELD(sm.status, 'pending', 'approved', 'rejected', 'revoked'), sm.requested_at DESC", [$uid]);
+        ORDER BY FIELD(sm.status, 'approved', 'pending', 'revoked', 'rejected'), sm.requested_at DESC", [$uid]);
     } catch (\Throwable $e) {
       $incoming = [];
     }
@@ -950,7 +1135,7 @@ final class SpaceController {
     $outgoing = [];
     try {
       $outgoing = Database::all("SELECT sm.id AS request_id, sm.space_id, sm.status, sm.requested_at, sm.approved_at,
-          s.title AS space_title, s.description, s.expires_at,
+          s.title AS space_title, s.category, s.description, s.expires_at,
           GREATEST(0, IFNULL(UNIX_TIMESTAMP(s.expires_at) - UNIX_TIMESTAMP(NOW()), 0)) AS seconds_left,
           o.id AS owner_id, o.display_name AS owner_name, o.code AS owner_code, o.personal_color AS owner_color,
           (SELECT id FROM space_media WHERE space_id = s.id ORDER BY position, id LIMIT 1) AS cover_media_id,
@@ -963,9 +1148,22 @@ final class SpaceController {
       foreach ($outgoing as &$out) {
         $sid = (int)$out['space_id'];
         $out['space_id'] = $sid;
+        $out['category'] = $out['category'] ?? 'gallery';
         $out['owner_id'] = (int)$out['owner_id'];
         $out['media_count'] = (int)$out['media_count'];
         $out['seconds_left'] = $out['expires_at'] ? (int)$out['seconds_left'] : null;
+        try {
+          // Viewer strictly sees ONLY their own replies & owner's replies (never others')
+          $out['my_comments'] = Database::all(
+            'SELECT c.id, c.media_id, c.user_id, c.body, c.owner_reply, c.replied_at, c.created_at,
+                    u.display_name AS user_name, u.personal_color AS user_color
+             FROM space_comments c JOIN users u ON u.id = c.user_id
+             WHERE c.space_id = ? AND c.user_id = ? ORDER BY c.created_at DESC',
+            [$sid, $uid]
+          );
+        } catch (\Throwable $e) {
+          $out['my_comments'] = [];
+        }
         if ($out['status'] === 'approved' && ($out['seconds_left'] === null || $out['seconds_left'] > 0)) {
           $meta = $this->fetchMediaWithViewStatus($sid, $uid);
           $out['media'] = $meta['media'];
@@ -991,32 +1189,56 @@ final class SpaceController {
     self::ensureSchema();
     $u = Auth::user($r);
     $uid = (int)$u['id'];
-    $reqId = Validator::int($r->input('request_id'), 'request_id');
-    $action = Validator::oneOf($r->input('action'), ['approve', 'reject', 'revoke'], 'action');
-
-    $row = Database::one(
-      'SELECT sm.id, sm.space_id, sm.user_id, s.owner_id, s.title
-       FROM space_members sm JOIN spaces s ON s.id = sm.space_id
-       WHERE sm.id = ? AND s.deleted_at IS NULL',
-      [$reqId]
-    );
-    if (!$row || (int)$row['owner_id'] !== $uid) throw new ApiException('Request not found', 404);
-
-    $statusMap = ['approve' => 'approved', 'reject' => 'rejected', 'revoke' => 'revoked'];
+    $action = Validator::oneOf($r->input('action'), ['approve', 'unblock', 'reject', 'revoke', 'block'], 'action');
+    $statusMap = [
+      'approve' => 'approved',
+      'unblock' => 'approved',
+      'reject'  => 'rejected',
+      'revoke'  => 'revoked',
+      'block'   => 'revoked',
+    ];
     $newStatus = $statusMap[$action];
+
+    $reqId = (int)$r->input('request_id', 0);
+    if ($reqId > 0) {
+      $row = Database::one(
+        'SELECT sm.id, sm.space_id, sm.user_id, s.owner_id, s.title
+         FROM space_members sm JOIN spaces s ON s.id = sm.space_id
+         WHERE sm.id = ? AND s.deleted_at IS NULL',
+        [$reqId]
+      );
+      if (!$row || (int)$row['owner_id'] !== $uid) throw new ApiException('Entry not found', 404);
+      if ($newStatus === 'approved') {
+        Database::run("UPDATE space_members SET status = 'approved', approved_at = NOW() WHERE id = ?", [$reqId]);
+      } else {
+        Database::run('UPDATE space_members SET status = ? WHERE id = ?', [$newStatus, $reqId]);
+      }
+      Response::ok(['request_id' => $reqId, 'status' => $newStatus]);
+    }
+
+    // Allow blocking or unblocking by space_id + user_id directly
+    $sid = Validator::int($r->input('space_id'), 'space_id');
+    $targetUserId = Validator::int($r->input('user_id'), 'user_id');
+    if ($targetUserId === $uid) throw new ApiException('Cannot block yourself', 422);
+    $space = Database::one('SELECT id, owner_id, title FROM spaces WHERE id = ? AND owner_id = ? AND deleted_at IS NULL', [$sid, $uid]);
+    if (!$space) throw new ApiException('Gallery not found', 404);
+
     if ($newStatus === 'approved') {
-      Database::run("UPDATE space_members SET status = 'approved', approved_at = NOW() WHERE id = ?", [$reqId]);
-      Notifier::send(
-        (int)$row['user_id'],
-        'space_access_approved',
-        'Gallery Access Accepted',
-        $u['display_name'] . ' accepted your request to view "' . $row['title'] . '"',
-        ['space_id' => (int)$row['space_id']]
+      Database::run(
+        "INSERT INTO space_members (space_id, user_id, status, requested_at, approved_at)
+         VALUES (?, ?, 'approved', NOW(), NOW())
+         ON DUPLICATE KEY UPDATE status = 'approved', approved_at = NOW()",
+        [$sid, $targetUserId]
       );
     } else {
-      Database::run('UPDATE space_members SET status = ? WHERE id = ?', [$newStatus, $reqId]);
+      Database::run(
+        "INSERT INTO space_members (space_id, user_id, status, requested_at)
+         VALUES (?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE status = VALUES(status)",
+        [$sid, $targetUserId, $newStatus]
+      );
     }
-    Response::ok(['request_id' => $reqId, 'status' => $newStatus]);
+    Response::ok(['space_id' => $sid, 'user_id' => $targetUserId, 'status' => $newStatus]);
   }
 
   /**
@@ -1105,7 +1327,7 @@ final class SpaceController {
     $s = $this->ownedPrivate((int)$u['id'], Validator::int($r->input('space_id'), 'space_id'));
     $newKey = self::generateAccessKey();
     Database::run('UPDATE spaces SET access_key = ? WHERE id = ?', [$newKey, $s['id']]);
-    Database::run("UPDATE space_members SET status = 'revoked' WHERE space_id = ? AND status = 'approved'", [$s['id']]);
+    Database::run("DELETE FROM space_members WHERE space_id = ? AND status IN ('approved', 'pending')", [$s['id']]);
     Database::run('UPDATE space_access_keys SET revoked_at = NOW() WHERE space_id = ? AND revoked_at IS NULL', [$s['id']]);
     Database::run('UPDATE space_grants SET revoked_at = NOW() WHERE space_id = ? AND revoked_at IS NULL', [$s['id']]);
     $this->purgeRelay((int)$s['id']);
